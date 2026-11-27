@@ -4,7 +4,7 @@ from unittest.mock import patch
 import chess
 import chess.engine
 
-from analyzer import build_tree, classify_move, evaluate_tree, fetch_games, opening_name
+from analyzer import build_tree, classify_move, evaluate_tree, explore_move, fetch_games, lines_of_interest, opening_name
 from app import app
 
 
@@ -33,6 +33,48 @@ class FakeEngine:
 
 
 class AnalyzerTests(unittest.TestCase):
+    def test_lines_of_interest_require_recorded_mistake_good_reply_and_favorable_score(self):
+        def node(uci, move, status, player_move, evaluation, children=None, games=1):
+            return {
+                "uci": uci, "move": move, "status": status, "player_move": player_move,
+                "evaluation": evaluation, "children": children or [], "path_games": games,
+                "path_last_played": 100, "opening_name": None,
+            }
+        good = node("e7e5", "e5", "Excellent", False, -50, games=3)
+        mistake = node("e2e4", "e4", "Mistake", True, 50, [good], games=4)
+        poor_reply = node("d7d5", "d5", "Inaccuracy", False, -100)
+        mistake["children"].append(poor_reply)
+        no_advantage = node("g8f6", "Nf6", "Book", False, 10)
+        mistake["children"].append(no_advantage)
+        unplayed = node("d2d4", "d4", "Blunder", True, -200, [good], games=0)
+        result = lines_of_interest({"children": [mistake, unplayed]})
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["moves"], ["e2e4", "e7e5"])
+        self.assertEqual(result[0]["games"], 3)
+        self.assertEqual(result[0]["evaluation"], -50)
+
+    def test_explore_unrecorded_move_and_reject_illegal_moves(self):
+        board = chess.Board()
+        with patch("analyzer.chess.engine.SimpleEngine.popen_uci") as factory:
+            factory.return_value.__enter__.return_value = FakeEngine({})
+            result = explore_move(board.fen(), "e2e4", "white", 2, 2)
+        self.assertEqual((result["uci"], result["move"], result["games"]), ("e2e4", "e4", 0))
+        self.assertTrue(result["children"])
+        self.assertTrue(all(child["games"] == 0 for child in result["children"]))
+        with self.assertRaisesRegex(ValueError, "not legal"):
+            explore_move(board.fen(), "e2e5", "white", 2, 2)
+        with self.assertRaisesRegex(ValueError, "line length"):
+            explore_move(chess.Board("rnbqkbnr/pppp1ppp/8/4p3/4P3/8/PPPP1PPP/RNBQKBNR w KQkq - 0 2").fen(),
+                         "g1f3", "white", 2, 1)
+
+    def test_move_api_reports_illegal_moves(self):
+        response = app.test_client().post("/api/move", json={
+            "fen": chess.Board().fen(), "uci": "e2e5", "color": "white",
+            "depth": 2, "max_moves": 10,
+        })
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("not legal", response.get_json()["error"])
+
     def test_tree_counts_recency_and_full_move_limit(self):
         tree, skipped = build_tree([
             game("1. e4 e5 2. Nf3 Nc6 *", 100),
@@ -45,6 +87,7 @@ class AnalyzerTests(unittest.TestCase):
         e4 = tree["children"]["e2e4"]
         self.assertEqual((e4["games"], e4["last_played"]), (2, 200))
         self.assertEqual(e4["children"]["e7e5"]["children"], {})
+        self.assertEqual((e4["uci"], e4["path_games"], e4["path_last_played"]), ("e2e4", 2, 200))
 
     def test_transpositions_aggregate_position_games_and_list_alternate_lines(self):
         games = [
