@@ -1,6 +1,9 @@
 import os
+import json
+import queue
+import threading
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, Response, jsonify, render_template, request
 
 from analyzer import analyze, explore_move
 
@@ -26,30 +29,90 @@ def game_limit(data):
     return value
 
 
+def analysis_arguments(data):
+    if not isinstance(data, dict):
+        raise ValueError("Expected a JSON object.")
+    username = data.get("username", "")
+    color = data.get("color")
+    if not isinstance(username, str):
+        raise ValueError("Username must be text.")
+    if color not in ("white", "black"):
+        raise ValueError("Choose white or black for the player.")
+    return (
+        username.strip(), color,
+        integer(data, "max_moves", 10, 1, 30),
+        game_limit(data),
+        integer(data, "depth", 8, 1, 20),
+    )
+
+
 @app.post("/api/analyze")
 def analyze_games():
     try:
-        data = request.get_json()
-        if not isinstance(data, dict):
-            raise ValueError("Expected a JSON object.")
-        username = data.get("username", "")
-        color = data.get("color")
-        if not isinstance(username, str):
-            raise ValueError("Username must be text.")
-        username = username.strip()
-        if color not in ("white", "black"):
-            raise ValueError("Choose white or black for the player.")
-        result = analyze(
-            username, color,
-            integer(data, "max_moves", 10, 1, 30),
-            game_limit(data),
-            integer(data, "depth", 8, 1, 20),
-        )
+        result = analyze(*analysis_arguments(request.get_json()))
         return jsonify(result)
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     except RuntimeError as exc:
         return jsonify(error=str(exc)), 502
+
+
+@app.post("/api/analyze/stream")
+def analyze_stream():
+    try:
+        arguments = analysis_arguments(request.get_json())
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+    events = queue.Queue(maxsize=32)
+    stopped = threading.Event()
+
+    class ClientDisconnected(Exception):
+        pass
+
+    def send(event):
+        while not stopped.is_set():
+            try:
+                events.put(event, timeout=0.2)
+                return
+            except queue.Full:
+                continue
+        raise ClientDisconnected()
+
+    def progress(phase, completed, total):
+        send({"type": "progress", "phase": phase, "completed": completed, "total": total})
+
+    def worker():
+        try:
+            send({"type": "result", "data": analyze(*arguments, progress=progress)})
+        except ClientDisconnected:
+            return
+        except (ValueError, RuntimeError) as exc:
+            try:
+                send({"type": "error", "error": str(exc)})
+            except ClientDisconnected:
+                return
+        except Exception:
+            app.logger.exception("Analysis failed")
+            try:
+                send({"type": "error", "error": "Unexpected analysis error. Check server logs."})
+            except ClientDisconnected:
+                return
+
+    def stream():
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+        try:
+            while True:
+                event = events.get()
+                yield json.dumps(event) + "\n"
+                if event["type"] in ("result", "error"):
+                    break
+        finally:
+            stopped.set()
+
+    return Response(stream(), mimetype="application/x-ndjson",
+                    headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
 @app.post("/api/move")

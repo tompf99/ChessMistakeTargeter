@@ -1,10 +1,11 @@
+import json
 import unittest
 from unittest.mock import patch
 
 import chess
 import chess.engine
 
-from analyzer import build_tree, classify_move, evaluate_tree, explore_move, fetch_games, lines_of_interest, opening_name
+from analyzer import build_tree, classify_move, evaluate_tree, explore_move, fetch_games, lines_of_interest
 from app import app
 
 
@@ -112,13 +113,53 @@ class AnalyzerTests(unittest.TestCase):
             second["transpositions"],
         )
 
-    def test_opening_name_comes_from_headers_or_chess_com_opening_url(self):
-        self.assertEqual(opening_name({"Opening": "Queen's Gambit"}), "Queen's Gambit")
-        self.assertEqual(
-            opening_name({"ECOUrl": "https://www.chess.com/openings/Queens-Gambit"}),
-            "Queens Gambit",
-        )
-        self.assertEqual(opening_name({"ECO": "C20"}), "ECO C20")
+    def test_opening_names_follow_positions_not_game_headers(self):
+        tree, _ = build_tree([
+            game('[Opening "Ruy Lopez"]\n\n1. e4 e5 2. Nf3 Nc6 3. Bb5 *', 100),
+        ], 3)
+        evaluate_tree(tree, FakeEngine({}), chess.WHITE, 2, 3)
+        self.assertIsNone(tree["opening_name"])
+        node = tree
+        names = []
+        for san in ["e4", "e5", "Nf3", "Nc6", "Bb5"]:
+            node = next(child for child in node["children"] if child["move"] == san)
+            names.append(node["opening_name"])
+        self.assertEqual(names[0], "King's Pawn Game")
+        self.assertEqual(names[2], "King's Knight Opening")
+        self.assertEqual(names[-1], "Ruy Lopez")
+
+    def test_engine_progress_counts_completed_games_including_shared_lines(self):
+        tree, skipped = build_tree([
+            game("1. e4 e5 *", 1), game("1. e4 e5 *", 2),
+            game("1. e4 *", 3), game("1. d4 d5 *", 4), game("", 5),
+        ], 2)
+        updates = []
+        evaluate_tree(tree, FakeEngine({}), chess.WHITE, 2, 2,
+                      progress=lambda phase, done, total: updates.append((phase, done, total)))
+        self.assertEqual(skipped, 1)
+        self.assertEqual(updates[0], ("analysis", 0, 4))
+        self.assertEqual(updates[-1], ("analysis", 4, 4))
+        self.assertEqual(sorted(done for _, done, _ in updates), [done for _, done, _ in updates])
+        self.assertTrue(all(total == 4 for _, _, total in updates))
+        self.assertNotIn("_finished_games", json.dumps(tree))
+
+    def test_stream_emits_progress_result_and_errors(self):
+        def fake_analyze(*args, progress):
+            progress("fetch", 1, 2)
+            progress("analysis", 1, 1)
+            return {"ok": True}
+        client = app.test_client()
+        with patch("app.analyze", side_effect=fake_analyze):
+            response = client.post("/api/analyze/stream", json={"username": "Alice", "color": "white"})
+            events = [json.loads(row) for row in response.get_data(as_text=True).splitlines()]
+        self.assertEqual([event["type"] for event in events], ["progress", "progress", "result"])
+        self.assertEqual(events[0]["total"], 2)
+        self.assertEqual(events[-1]["data"], {"ok": True})
+        with patch("app.analyze", side_effect=RuntimeError("Engine failed")):
+            response = client.post("/api/analyze/stream", json={"username": "Alice", "color": "white"})
+            self.assertEqual(json.loads(response.get_data(as_text=True))["error"], "Engine failed")
+        response = client.post("/api/analyze/stream", json={"username": "Alice", "color": "white", "max_moves": 0})
+        self.assertEqual(response.status_code, 400)
 
     def test_move_classification_uses_centipawn_loss_bands(self):
         self.assertEqual(classify_move(0), "Excellent")
@@ -186,7 +227,7 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual([child["move"] for child in e4["children"][:3]], ["d5", "c5", "e5"])
         self.assertEqual([child["loss"] for child in e4["children"][:3]], [0, 20, 60])
         self.assertEqual([child["status"] for child in e4["children"][:3]], [
-            "Excellent", "Excellent", "Inaccuracy"
+            "Excellent", "Book", "Inaccuracy"
         ])
         self.assertTrue(all(not child["children"] for child in e4["children"]))
         self.assertTrue(all(not child["children"] for child in tree["children"][:-1]))
@@ -204,8 +245,10 @@ class AnalyzerTests(unittest.TestCase):
             ]},
         }
         with patch("analyzer.get_json", side_effect=lambda url: {"archives": archives} if url.endswith("/archives") else games[url]):
-            selected = fetch_games("Alice", "white", 2)
+            progress = []
+            selected = fetch_games("Alice", "white", 2, lambda *event: progress.append(event))
         self.assertEqual([item["pgn"] for item in selected], ["b", "a"])
+        self.assertEqual(progress, [("fetch", 0, 2), ("fetch", 1, 2), ("fetch", 2, 2)])
 
     def test_fetch_unlimited_and_limits_over_1000(self):
         games = [

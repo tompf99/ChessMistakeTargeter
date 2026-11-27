@@ -1,14 +1,16 @@
 """Fetch Chess.com games and evaluate their opening tree."""
 
 import io
+import csv
 import re
 import shutil
 import urllib.error
 import urllib.request
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from datetime import datetime, timezone
-from urllib.parse import unquote, urlparse
+from functools import lru_cache
+from pathlib import Path
 
 import chess
 import chess.engine
@@ -37,10 +39,12 @@ def get_json(url):
         raise RuntimeError(f"Could not reach Chess.com: {exc}") from exc
 
 
-def fetch_games(username, color, limit):
+def fetch_games(username, color, limit, progress=None):
     archives = get_json(f"{API}/player/{username}/games/archives")["archives"]
     selected = []
-    for archive in reversed(archives):
+    if progress:
+        progress("fetch", 0, len(archives))
+    for index, archive in enumerate(reversed(archives), 1):
         games = get_json(archive)["games"]
         games.sort(key=lambda game: game.get("end_time", 0), reverse=True)
         for game in games:
@@ -49,7 +53,11 @@ def fetch_games(username, color, limit):
                     and game.get("rules") == "chess" and game.get("pgn")):
                 selected.append(game)
                 if limit is not None and len(selected) == limit:
+                    if progress:
+                        progress("fetch", index, len(archives))
                     return selected
+        if progress:
+            progress("fetch", index, len(archives))
     return selected
 
 
@@ -69,17 +77,19 @@ def position_key(board):
     return (board.board_fen(), board.turn, board.castling_xfen(), ep_square)
 
 
-def opening_name(headers):
-    name = headers.get("Opening", "").strip()
-    if name and name.casefold() not in {"unknown", "unknown opening"}:
-        return name
-    eco_url = headers.get("ECOUrl", "").strip()
-    if eco_url:
-        slug = unquote(urlparse(eco_url).path.rstrip("/").split("/")[-1])
-        if slug:
-            return slug.replace("-", " ")
-    eco = headers.get("ECO", "").strip()
-    return f"ECO {eco}" if eco else None
+@lru_cache(maxsize=1)
+def opening_positions():
+    positions = {}
+    directory = Path(__file__).parent / "data" / "openings"
+    for volume in "abcde":
+        with (directory / f"{volume}.tsv").open(encoding="utf-8", newline="") as source:
+            for entry in csv.DictReader(source, delimiter="\t"):
+                board = chess.Board()
+                for token in entry["pgn"].split():
+                    if not token.endswith("."):
+                        board.push_san(token)
+                positions[position_key(board)] = entry["name"]
+    return positions
 
 
 def format_line(moves):
@@ -95,18 +105,16 @@ def build_tree(games, max_moves):
     root = new_node("", chess.Board().fen())
     skipped = 0
     position_stats = defaultdict(lambda: {
-        "games": set(), "last_played": 0, "routes": defaultdict(set), "openings": Counter(),
+        "games": set(), "last_played": 0, "routes": defaultdict(set),
     })
     edge_stats = defaultdict(lambda: {"games": set(), "last_played": 0})
 
-    def add_position(board, game_id, date, path, opening):
+    def add_position(board, game_id, date, path):
         key = position_key(board)
         stat = position_stats[key]
         stat["games"].add(game_id)
         stat["last_played"] = max(stat["last_played"], date)
         stat["routes"][tuple(path)].add(game_id)
-        if opening:
-            stat["openings"][opening] += 1
         return key
 
     for game_id, game in enumerate(games):
@@ -116,7 +124,6 @@ def build_tree(games, max_moves):
                 skipped += 1
                 continue
             board = parsed.board()
-            opening = opening_name(parsed.headers)
             moves = []
             for move in parsed.mainline_moves():
                 if len(moves) == max_moves * 2:
@@ -139,7 +146,7 @@ def build_tree(games, max_moves):
         node["path_last_played"] = max(node["path_last_played"], date)
         board = chess.Board()
         path = []
-        node["position_key"] = add_position(board, game_id, date, path, opening)
+        node["position_key"] = add_position(board, game_id, date, path)
         node["_path"] = tuple(path)
         for uci, san, fen, source_key, target_key in moves:
             edge = edge_stats[(source_key, uci)]
@@ -155,7 +162,8 @@ def build_tree(games, max_moves):
             node["position_key"] = target_key
             node["_path"] = tuple(path)
             board.push_uci(uci)
-            add_position(board, game_id, date, path, opening)
+            add_position(board, game_id, date, path)
+        node["_finished_games"] = node.get("_finished_games", 0) + 1
 
     # Preserve the trie edge keys while adding aggregate position metadata.
     def prepare(node):
@@ -169,10 +177,6 @@ def build_tree(games, max_moves):
         stat = position_stats.get(node["position_key"])
         if stat:
             node["position_games"] = len(stat["games"])
-            node["opening_name"] = (
-                sorted(stat["openings"].items(), key=lambda item: (-item[1], item[0]))[0][0]
-                if stat["openings"] else None
-            )
             routes = sorted(stat["routes"].items(), key=lambda item: (-len(item[1]), item[0]))
             node["transpositions"] = [
                 {"line": format_line(route), "moves": list(route), "games": len(route_games)}
@@ -197,12 +201,17 @@ def classify_move(loss, is_book=False):
     return "Blunder"
 
 
-def evaluate_tree(root, engine, player_color, depth, max_moves, start_ply=0):
+def evaluate_tree(root, engine, player_color, depth, max_moves, start_ply=0, progress=None):
     """Scores and swings are always from the chosen player's perspective."""
     cache = {}
     analysis = root.pop("_analysis", {"edge_stats": {}, "position_stats": {}})
     edge_stats = analysis["edge_stats"]
     position_stats = analysis["position_stats"]
+    openings = opening_positions()
+    completed_games = 0
+    total_games = root["path_games"]
+    if progress:
+        progress("analysis", 0, total_games)
     moves_by_position = defaultdict(list)
     for source_key, uci in edge_stats:
         moves_by_position[source_key].append(uci)
@@ -249,10 +258,6 @@ def evaluate_tree(root, engine, player_color, depth, max_moves, start_ply=0):
         if not stat:
             return
         node["position_games"] = len(stat["games"])
-        node["opening_name"] = (
-            sorted(stat["openings"].items(), key=lambda item: (-item[1], item[0]))[0][0]
-            if stat["openings"] else None
-        )
         node["transpositions"] = [
             {"line": format_line(path), "moves": list(path), "games": len(route_games)}
             for path, route_games in sorted(
@@ -260,12 +265,20 @@ def evaluate_tree(root, engine, player_color, depth, max_moves, start_ply=0):
             ) if path != tuple(route)
         ][:8]
 
-    def walk(node, ply=0, route=()):
+    def finish(node):
+        nonlocal completed_games
+        completed_games += node.get("_finished_games", 0)
+        if progress and node.get("_finished_games", 0):
+            progress("analysis", completed_games, total_games)
+
+    def walk(node, ply=0, route=(), previous_opening=None):
         node["evaluation"] = score(node["fen"])
+        node["opening_name"] = openings.get(position_key(chess.Board(node["fen"])), previous_opening)
         recorded = node["children"]
         node["children"] = []
         apply_position_stats(node, route)
         if ply >= max_moves * 2:
+            finish(node)
             return
         board = chess.Board(node["fen"])
         transposed_moves = [chess.Move.from_uci(uci) for uci in moves_by_position[position_key(board)]]
@@ -274,6 +287,7 @@ def evaluate_tree(root, engine, player_color, depth, max_moves, start_ply=0):
         ]), key=lambda move: move.uci())
         scores = candidate_scores(board, moves)
         if not scores:
+            finish(node)
             return
         ranked = sorted(scores, key=lambda move: (-scores[move], move.uci()))
         best = scores[ranked[0]]
@@ -294,6 +308,7 @@ def evaluate_tree(root, engine, player_color, depth, max_moves, start_ply=0):
             child["loss"] = best - scores[move]
             child["engine_choice"] = index < ENGINE_CHOICES
             child["player_move"] = board.turn == player_color
+            child["opening_name"] = openings.get(position_key(chess.Board(child["fen"])), node["opening_name"])
             child_route = route + (child["move"],)
             apply_position_stats(child, child_route)
             child["status"] = classify_move(
@@ -304,16 +319,18 @@ def evaluate_tree(root, engine, player_color, depth, max_moves, start_ply=0):
                 ),
             )
             if child["games"] and uci in recorded:
-                walk(child, ply + 1, child_route)
+                walk(child, ply + 1, child_route, node["opening_name"])
             else:
                 child["children"] = []
                 child["evaluation"] = score(child["fen"])
             node["children"].append(child)
+        finish(node)
 
     walk(root, start_ply)
 
     def remove_internal_fields(node):
         node.pop("_path", None)
+        node.pop("_finished_games", None)
         node.pop("position_key", None)
         for child in node["children"]:
             remove_internal_fields(child)
@@ -388,16 +405,22 @@ def find_engine():
     return shutil.which("stockfish") or "/usr/games/stockfish"
 
 
-def analyze(username, color, max_moves, max_games, depth):
+def analyze(username, color, max_moves, max_games, depth, progress=None):
     if not USERNAME.fullmatch(username):
         raise ValueError("Enter a valid Chess.com username (1-25 letters, numbers, underscores or hyphens).")
-    games = fetch_games(username, color, max_games)
+    if progress:
+        progress("fetch", 0, None)
+        games = fetch_games(username, color, max_games, progress=progress)
+        progress("prepare", 0, None)
+    else:
+        games = fetch_games(username, color, max_games)
     root, skipped = build_tree(games, max_moves)
     if not root["games"]:
         raise ValueError("No usable standard chess games found for that player and color.")
     try:
         with chess.engine.SimpleEngine.popen_uci(find_engine(), timeout=30) as engine:
-            evaluate_tree(root, engine, chess.WHITE if color == "white" else chess.BLACK, depth, max_moves)
+            evaluate_tree(root, engine, chess.WHITE if color == "white" else chess.BLACK, depth, max_moves,
+                          progress=progress)
     except FileNotFoundError as exc:
         raise RuntimeError("Stockfish was not found. Install it or set STOCKFISH_PATH.") from exc
     except (chess.engine.EngineError, OSError, TimeoutError) as exc:

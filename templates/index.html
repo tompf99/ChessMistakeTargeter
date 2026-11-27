@@ -22,6 +22,12 @@
       <button type="submit">Analyze games</button>
     </form>
     <p id="message" role="status" aria-live="polite"></p>
+    <div id="progress" class="progress" hidden>
+      <label id="fetch-label" for="fetch-progress">Fetching archives</label>
+      <progress id="fetch-progress"></progress>
+      <label id="analysis-label" for="analysis-progress">Waiting to analyze games</label>
+      <progress id="analysis-progress"></progress>
+    </div>
     <section id="results" hidden>
       <p id="summary"></p>
       <div class="tabs" role="tablist" aria-label="Analysis views">

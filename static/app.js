@@ -30,6 +30,20 @@ function drawBoard(fen) {
         square.setAttribute("aria-label", `${square.dataset.square}${pieces[char] ? ` ${char}` : ""}`);
         square.classList.toggle("selected", selectedSquare === square.dataset.square);
         square.textContent = pieces[char] || "";
+        if (col === 0 || row === 7) {
+          const label = document.createElement("span");
+          label.className = `coordinate ${col === 0 ? "rank-label" : "file-label"}`;
+          label.setAttribute("aria-hidden", "true");
+          label.textContent = col === 0 ? String(8 - row) : "abcdefgh"[col];
+          square.append(label);
+          if (col === 0 && row === 7) {
+            const file = document.createElement("span");
+            file.className = "coordinate file-label";
+            file.setAttribute("aria-hidden", "true");
+            file.textContent = "a";
+            square.append(file);
+          }
+        }
         board.append(square);
       }
     }
@@ -204,8 +218,9 @@ function render() {
     "aria-label", `${evalScore.textContent}, positive favors White`
   );
   const opening = document.querySelector("#opening-name");
-  opening.textContent = node.opening_name ? `Opening: ${node.opening_name}` : "";
-  opening.hidden = !node.opening_name;
+  const openingName = line.slice(0, cursor + 1).reverse().find(step => step.opening_name)?.opening_name;
+  opening.textContent = openingName ? `Opening: ${openingName}` : "";
+  opening.hidden = !openingName;
   const transpositions = document.querySelector("#transpositions");
   transpositions.replaceChildren();
   transpositions.hidden = node.transpositions.length === 0;
@@ -285,7 +300,7 @@ let pointerStart = null;
 board.addEventListener("pointerdown", event => {
   const square = event.target.closest(".square");
   if (!square || event.button !== 0 || moving) return;
-  pointerStart = { square: square.dataset.square, x: event.clientX, y: event.clientY, piece: square.dataset.movable === "true" ? square.textContent : "", ghost: null };
+  pointerStart = { square: square.dataset.square, x: event.clientX, y: event.clientY, piece: square.dataset.movable === "true" ? pieces[square.dataset.piece] : "", ghost: null };
   square.setPointerCapture(event.pointerId);
   event.preventDefault();
 });
@@ -347,6 +362,59 @@ document.addEventListener("keydown", event => {
     render();
   }
 });
+
+function updateProgress(event) {
+  const fetchBar = document.querySelector("#fetch-progress");
+  const analysisBar = document.querySelector("#analysis-progress");
+  if (event.phase === "fetch") {
+    const fetchLabel = document.querySelector("#fetch-label");
+    if (event.total == null) {
+      fetchBar.removeAttribute("value");
+      fetchLabel.textContent = "Fetching archive list…";
+    } else {
+      fetchBar.max = Math.max(event.total, 1);
+      fetchBar.value = event.total ? event.completed : 1;
+      fetchLabel.textContent = `Fetching archives: ${event.completed} of ${event.total}`;
+    }
+  } else if (event.phase === "prepare") {
+    document.querySelector("#analysis-label").textContent = "Preparing games…";
+  } else if (event.phase === "analysis") {
+    analysisBar.max = Math.max(event.total, 1);
+    analysisBar.value = event.completed;
+    document.querySelector("#analysis-label").textContent = event.completed === event.total
+      ? `Analyzed ${event.completed} of ${event.total} games`
+      : `Analyzing game ${event.completed + 1} of ${event.total} (${event.completed} complete)`;
+  }
+}
+
+async function readAnalysis(response) {
+  if (!response.ok) {
+    const data = await response.json();
+    throw new Error(data.error || "Analysis failed.");
+  }
+  if (!response.body) throw new Error("Streaming analysis is unavailable in this browser.");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let result = null;
+  while (true) {
+    const {value, done} = await reader.read();
+    buffer += decoder.decode(value, {stream: !done});
+    const rows = buffer.split("\n");
+    buffer = rows.pop();
+    for (const row of rows) {
+      if (!row) continue;
+      const event = JSON.parse(row);
+      if (event.type === "progress") updateProgress(event);
+      if (event.type === "error") throw new Error(event.error);
+      if (event.type === "result") result = event.data;
+    }
+    if (done) break;
+  }
+  if (buffer.trim() || !result) throw new Error("Analysis ended before results were received.");
+  return result;
+}
+
 form.addEventListener("submit", async event => {
   event.preventDefault();
   const values = new FormData(form);
@@ -359,13 +427,18 @@ form.addEventListener("submit", async event => {
   const submit = form.querySelector("button");
   submit.disabled = true;
   results.hidden = true;
-  message.textContent = "Fetching games and analyzing positions. This can take several minutes.";
+  message.textContent = "";
+  const progress = document.querySelector("#progress");
+  progress.hidden = false;
+  document.querySelector("#fetch-progress").removeAttribute("value");
+  document.querySelector("#analysis-progress").removeAttribute("value");
+  document.querySelector("#fetch-label").textContent = "Fetching archive list…";
+  document.querySelector("#analysis-label").textContent = "Waiting to analyze games";
   try {
-    const response = await fetch("/api/analyze", {
+    const response = await fetch("/api/analyze/stream", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
     });
-    const data = await response.json();
-    if (!response.ok) throw new Error(data.error || "Analysis failed.");
+    const data = await readAnalysis(response);
     line = [data.tree];
     cursor = 0;
     settings = payload;
@@ -380,5 +453,6 @@ form.addEventListener("submit", async event => {
     message.textContent = error.message;
   } finally {
     submit.disabled = false;
+    progress.hidden = true;
   }
 });
