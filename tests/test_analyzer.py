@@ -4,7 +4,7 @@ from unittest.mock import patch
 import chess
 import chess.engine
 
-from analyzer import build_tree, evaluate_tree, fetch_games
+from analyzer import build_tree, classify_move, evaluate_tree, fetch_games, opening_name
 from app import app
 
 
@@ -46,42 +46,74 @@ class AnalyzerTests(unittest.TestCase):
         self.assertEqual((e4["games"], e4["last_played"]), (2, 200))
         self.assertEqual(e4["children"]["e7e5"]["children"], {})
 
-    def test_mistakes_are_relative_to_player_and_accumulate_on_path(self):
-        tree, _ = build_tree([
-            game("1. e4 e5 2. Nf3 *", 100),
-            game("1. e4 e5 2. Bc4 *", 200),
-        ], 10)
-        e4 = tree["children"]["e2e4"]
-        e5 = e4["children"]["e7e5"]
-        nf3 = e5["children"]["g1f3"]
-        bc4 = e5["children"]["f1c4"]
-        scores = {tree["fen"]: 0, e4["fen"]: 0, e5["fen"]: 100,
-                  nf3["fen"]: 99, bc4["fen"]: 100}
-        evaluate_tree(tree, FakeEngine(scores), chess.BLACK, 8, 100, 10)
-        self.assertTrue(e5["opponent_mistake"])
-        self.assertFalse(e5["our_mistake"])
-        self.assertTrue(nf3["opponent_mistake"])
-        self.assertTrue(nf3["our_mistake"])
-        self.assertTrue(bc4["opponent_mistake"])
-        self.assertFalse(bc4["our_mistake"])
-        self.assertEqual(e5["swing"], -100)
+    def test_transpositions_aggregate_position_games_and_list_alternate_lines(self):
+        games = [
+            game('1. Nf3 d5 2. g3 Nf6 *', 100),
+            game('1. g3 d5 2. Nf3 Nf6 *', 200),
+        ]
+        tree, skipped = build_tree(games, 10)
+        first = tree["children"]["g1f3"]["children"]["d7d5"]["children"]["g2g3"]
+        second = tree["children"]["g2g3"]["children"]["d7d5"]["children"]["g1f3"]
+        self.assertEqual(skipped, 0)
+        self.assertEqual(first["position_key"], second["position_key"])
+        self.assertEqual(first["position_games"], 2)
+        self.assertEqual(second["position_games"], 2)
+        self.assertEqual(first["games"], 1)
+        self.assertEqual(second["games"], 1)
+        self.assertIn(
+            {"line": "1. g3 d5 2. Nf3", "moves": ["g3", "d5", "Nf3"], "games": 1},
+            first["transpositions"],
+        )
+        self.assertIn(
+            {"line": "1. Nf3 d5 2. g3", "moves": ["Nf3", "d5", "g3"], "games": 1},
+            second["transpositions"],
+        )
 
-    def test_white_player_mistake_threshold_and_frequency_sort(self):
+    def test_opening_name_comes_from_headers_or_chess_com_opening_url(self):
+        self.assertEqual(opening_name({"Opening": "Queen's Gambit"}), "Queen's Gambit")
+        self.assertEqual(
+            opening_name({"ECOUrl": "https://www.chess.com/openings/Queens-Gambit"}),
+            "Queens Gambit",
+        )
+        self.assertEqual(opening_name({"ECO": "C20"}), "ECO C20")
+
+    def test_move_classification_uses_centipawn_loss_bands(self):
+        self.assertEqual(classify_move(0), "Excellent")
+        self.assertEqual(classify_move(20), "Excellent")
+        self.assertEqual(classify_move(21), "Inaccuracy")
+        self.assertEqual(classify_move(100), "Inaccuracy")
+        self.assertEqual(classify_move(101), "Mistake")
+        self.assertEqual(classify_move(200), "Mistake")
+        self.assertEqual(classify_move(201), "Blunder")
+        self.assertEqual(classify_move(0, is_book=True), "Book")
+
+    def test_book_requires_recognized_opening_and_small_loss(self):
         tree, _ = build_tree([
-            game("1. e4 e5 *", 100),
-            game("1. e4 c5 *", 200),
-            game("1. d4 d5 *", 300),
-        ], 10)
-        e4 = tree["children"]["e2e4"]
-        d4 = tree["children"]["d2d4"]
-        e5, c5 = e4["children"]["e7e5"], e4["children"]["c7c5"]
-        d5 = d4["children"]["d7d5"]
-        scores = {tree["fen"]: 0, e4["fen"]: -99, d4["fen"]: -100,
-                  e5["fen"]: -99, c5["fen"]: -100, d5["fen"]: -100}
-        evaluate_tree(tree, FakeEngine(scores), chess.WHITE, 8, 100, 10)
-        self.assertFalse(e4["opponent_mistake"])
-        self.assertTrue(d4["opponent_mistake"])
-        self.assertFalse(d5["our_mistake"])
+            game('[Opening "Italian Game"]\n\n1. e4 *', 100),
+        ], 1)
+        board = chess.Board()
+        scores = {}
+        for san, score in [("e4", 100), ("d4", 80), ("Nf3", 60), ("c4", 0)]:
+            move = board.parse_san(san)
+            board.push(move)
+            scores[board.fen()] = score
+            board.pop()
+        evaluate_tree(tree, FakeEngine(scores), chess.WHITE, 8, 1)
+        e4 = next(child for child in tree["children"] if child["move"] == "e4")
+        self.assertEqual(e4["status"], "Book")
+
+        tree, _ = build_tree([
+            game('[Opening "Italian Game"]\n\n1. e4 *', 100),
+        ], 1)
+        scores = {}
+        for san, score in [("d4", 100), ("Nf3", 90), ("c4", 80), ("e4", 0)]:
+            move = board.parse_san(san)
+            board.push(move)
+            scores[board.fen()] = score
+            board.pop()
+        evaluate_tree(tree, FakeEngine(scores), chess.WHITE, 8, 1)
+        e4 = next(child for child in tree["children"] if child["move"] == "e4")
+        self.assertEqual(e4["status"], "Inaccuracy")
 
     def test_move_ranking_includes_engine_choices_and_preserves_played_counts(self):
         tree, _ = build_tree([game("1. e4 e5 *", 100), game("1. e4 c5 *", 200)], 1)
@@ -98,16 +130,21 @@ class AnalyzerTests(unittest.TestCase):
             board.push(move)
             scores[board.fen()] = score
             board.pop()
-        evaluate_tree(tree, FakeEngine(scores), chess.WHITE, 8, 100, 1)
+        evaluate_tree(tree, FakeEngine(scores), chess.WHITE, 8, 1)
         self.assertEqual([child["move"] for child in tree["children"]], ["d4", "Nf3", "c4", "e4"])
         self.assertEqual([child["loss"] for child in tree["children"]], [0, 20, 40, 120])
         self.assertEqual(tree["children"][0]["games"], 0)
         self.assertTrue(tree["children"][0]["engine_choice"])
+        self.assertEqual(tree["children"][0]["status"], "Excellent")
         e4 = tree["children"][-1]
         self.assertEqual(e4["games"], 2)
         self.assertFalse(e4["engine_choice"])
+        self.assertEqual(e4["status"], "Mistake")
         self.assertEqual([child["move"] for child in e4["children"][:3]], ["d5", "c5", "e5"])
         self.assertEqual([child["loss"] for child in e4["children"][:3]], [0, 20, 60])
+        self.assertEqual([child["status"] for child in e4["children"][:3]], [
+            "Excellent", "Excellent", "Inaccuracy"
+        ])
         self.assertTrue(all(not child["children"] for child in e4["children"]))
         self.assertTrue(all(not child["children"] for child in tree["children"][:-1]))
 

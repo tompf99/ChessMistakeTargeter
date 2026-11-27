@@ -6,7 +6,9 @@ import shutil
 import urllib.error
 import urllib.request
 import json
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from urllib.parse import unquote, urlparse
 
 import chess
 import chess.engine
@@ -17,6 +19,9 @@ API = "https://api.chess.com/pub"
 HEADERS = {"User-Agent": "ChessMistakeTargeter/1.0 (local opening analysis)"}
 USERNAME = re.compile(r"^[A-Za-z0-9_-]{1,25}$")
 ENGINE_CHOICES = 3
+EXCELLENT_MAX_LOSS = 20
+INACCURACY_MAX_LOSS = 100
+MISTAKE_MAX_LOSS = 200
 
 
 def get_json(url):
@@ -50,30 +55,75 @@ def fetch_games(username, color, limit):
 
 def new_node(san, fen):
     return {
-        "move": san, "fen": fen, "games": 0, "last_played": 0,
+        "move": san, "fen": fen, "games": 0, "position_games": 0,
+        "last_played": 0, "opening_name": None, "transpositions": [],
         "children": {}, "evaluation": None, "swing": None,
         "rank": None, "loss": None, "engine_choice": False,
-        "opponent_mistake": False, "our_mistake": False,
+        "status": None, "player_move": False, "position_key": None,
     }
+
+
+def position_key(board):
+    ep_square = board.ep_square if board.has_legal_en_passant() else None
+    return (board.board_fen(), board.turn, board.castling_xfen(), ep_square)
+
+
+def opening_name(headers):
+    name = headers.get("Opening", "").strip()
+    if name and name.casefold() not in {"unknown", "unknown opening"}:
+        return name
+    eco_url = headers.get("ECOUrl", "").strip()
+    if eco_url:
+        slug = unquote(urlparse(eco_url).path.rstrip("/").split("/")[-1])
+        if slug:
+            return slug.replace("-", " ")
+    eco = headers.get("ECO", "").strip()
+    return f"ECO {eco}" if eco else None
+
+
+def format_line(moves):
+    result = []
+    for index, move in enumerate(moves):
+        if index % 2 == 0:
+            result.append(f"{index // 2 + 1}.")
+        result.append(move)
+    return " ".join(result)
 
 
 def build_tree(games, max_moves):
     root = new_node("", chess.Board().fen())
     skipped = 0
-    for game in games:
+    position_stats = defaultdict(lambda: {
+        "games": set(), "last_played": 0, "routes": defaultdict(set), "openings": Counter(),
+    })
+    edge_stats = defaultdict(lambda: {"games": set(), "last_played": 0})
+
+    def add_position(board, game_id, date, path, opening):
+        key = position_key(board)
+        stat = position_stats[key]
+        stat["games"].add(game_id)
+        stat["last_played"] = max(stat["last_played"], date)
+        stat["routes"][tuple(path)].add(game_id)
+        if opening:
+            stat["openings"][opening] += 1
+        return key
+
+    for game_id, game in enumerate(games):
         try:
             parsed = chess.pgn.read_game(io.StringIO(game["pgn"]))
             if parsed is None or parsed.errors or parsed.board().fen() != chess.Board().fen():
                 skipped += 1
                 continue
             board = parsed.board()
+            opening = opening_name(parsed.headers)
             moves = []
             for move in parsed.mainline_moves():
                 if len(moves) == max_moves * 2:
                     break
                 san = board.san(move)
+                source_key = position_key(board)
                 board.push(move)
-                moves.append((move.uci(), san, board.fen()))
+                moves.append((move.uci(), san, board.fen(), source_key, position_key(board)))
         except (ValueError, KeyError, IndexError):
             skipped += 1
             continue
@@ -84,16 +134,72 @@ def build_tree(games, max_moves):
         node = root
         node["games"] += 1
         node["last_played"] = max(node["last_played"], date)
-        for uci, san, fen in moves:
+        board = chess.Board()
+        path = []
+        node["position_key"] = add_position(board, game_id, date, path, opening)
+        node["_path"] = tuple(path)
+        for uci, san, fen, source_key, target_key in moves:
+            edge = edge_stats[(source_key, uci)]
+            edge["games"].add(game_id)
+            edge["last_played"] = max(edge["last_played"], date)
+            path.append(san)
             node = node["children"].setdefault(uci, new_node(san, fen))
             node["games"] += 1
             node["last_played"] = max(node["last_played"], date)
+            node["position_key"] = target_key
+            node["_path"] = tuple(path)
+            board.push_uci(uci)
+            add_position(board, game_id, date, path, opening)
+
+    # Preserve the trie edge keys while adding aggregate position metadata.
+    def prepare(node):
+        child_map = node["children"]
+        for uci, child in child_map.items():
+            edge = edge_stats.get((node["position_key"], uci))
+            if edge:
+                child["games"] = len(edge["games"])
+                child["last_played"] = edge["last_played"]
+            prepare(child)
+        stat = position_stats.get(node["position_key"])
+        if stat:
+            node["position_games"] = len(stat["games"])
+            node["opening_name"] = (
+                sorted(stat["openings"].items(), key=lambda item: (-item[1], item[0]))[0][0]
+                if stat["openings"] else None
+            )
+            routes = sorted(stat["routes"].items(), key=lambda item: (-len(item[1]), item[0]))
+            node["transpositions"] = [
+                {"line": format_line(route), "moves": list(route), "games": len(route_games)}
+                for route, route_games in routes if route != node.get("_path", ())
+            ][:8]
+        node["children"] = child_map
+
+    prepare(root)
+    root["_analysis"] = {"edge_stats": edge_stats, "position_stats": position_stats}
     return root, skipped
 
 
-def evaluate_tree(root, engine, player_color, depth, threshold, max_moves):
+def classify_move(loss, is_book=False):
+    if is_book:
+        return "Book"
+    if loss <= EXCELLENT_MAX_LOSS:
+        return "Excellent"
+    if loss <= INACCURACY_MAX_LOSS:
+        return "Inaccuracy"
+    if loss <= MISTAKE_MAX_LOSS:
+        return "Mistake"
+    return "Blunder"
+
+
+def evaluate_tree(root, engine, player_color, depth, max_moves):
     """Scores and swings are always from the chosen player's perspective."""
     cache = {}
+    analysis = root.pop("_analysis", {"edge_stats": {}, "position_stats": {}})
+    edge_stats = analysis["edge_stats"]
+    position_stats = analysis["position_stats"]
+    moves_by_position = defaultdict(list)
+    for source_key, uci in edge_stats:
+        moves_by_position[source_key].append(uci)
 
     def score(fen):
         if fen not in cache:
@@ -132,22 +238,34 @@ def evaluate_tree(root, engine, player_color, depth, threshold, max_moves):
             raise RuntimeError("The engine did not evaluate all requested moves.")
         return scores
 
-    def walk(node, ply=0, previous_score=None, opponent_mistake=False, our_mistake=False):
+    def apply_position_stats(node, route):
+        stat = position_stats.get(position_key(chess.Board(node["fen"])))
+        if not stat:
+            return
+        node["position_games"] = len(stat["games"])
+        node["opening_name"] = (
+            sorted(stat["openings"].items(), key=lambda item: (-item[1], item[0]))[0][0]
+            if stat["openings"] else None
+        )
+        node["transpositions"] = [
+            {"line": format_line(path), "moves": list(path), "games": len(route_games)}
+            for path, route_games in sorted(
+                stat["routes"].items(), key=lambda item: (-len(item[1]), item[0])
+            ) if path != tuple(route)
+        ][:8]
+
+    def walk(node, ply=0, route=()):
         node["evaluation"] = score(node["fen"])
-        if previous_score is not None:
-            node["swing"] = node["evaluation"] - previous_score
-            # FEN's side to move is the opposite of the player who just moved.
-            mover = not chess.Board(node["fen"]).turn
-            opponent_mistake |= mover == player_color and node["swing"] <= -threshold
-            our_mistake |= mover != player_color and node["swing"] > 0
-        node["opponent_mistake"] = opponent_mistake
-        node["our_mistake"] = our_mistake
         recorded = node["children"]
         node["children"] = []
+        apply_position_stats(node, route)
         if ply >= max_moves * 2:
             return
         board = chess.Board(node["fen"])
-        moves = [chess.Move.from_uci(uci) for uci in recorded]
+        transposed_moves = [chess.Move.from_uci(uci) for uci in moves_by_position[position_key(board)]]
+        moves = sorted(set(transposed_moves + [
+            chess.Move.from_uci(uci) for uci in recorded
+        ]), key=lambda move: move.uci())
         scores = candidate_scores(board, moves)
         if not scores:
             return
@@ -161,24 +279,39 @@ def evaluate_tree(root, engine, player_color, depth, threshold, max_moves):
                 board.push(move)
                 child = new_node(san, board.fen())
                 board.pop()
+                child["position_key"] = position_key(chess.Board(child["fen"]))
+                edge = edge_stats.get((position_key(board), uci))
+                if edge:
+                    child["games"] = len(edge["games"])
+                    child["last_played"] = edge["last_played"]
             child["rank"] = index + 1
             child["loss"] = best - scores[move]
-            child["engine_choice"] = index < ENGINE_CHOICES or not child["games"]
-            if child["games"]:
-                walk(child, ply + 1, node["evaluation"], opponent_mistake, our_mistake)
+            child["engine_choice"] = index < ENGINE_CHOICES
+            child["player_move"] = board.turn == player_color
+            child_route = route + (child["move"],)
+            apply_position_stats(child, child_route)
+            child["status"] = classify_move(
+                child["loss"],
+                is_book=bool(
+                    child["games"] and ply < 20 and child["opening_name"]
+                    and child["loss"] <= EXCELLENT_MAX_LOSS
+                ),
+            )
+            if child["games"] and uci in recorded:
+                walk(child, ply + 1, child_route)
             else:
                 child["children"] = []
                 child["evaluation"] = score(child["fen"])
-                child["swing"] = child["evaluation"] - node["evaluation"]
-                child["opponent_mistake"] = opponent_mistake or (
-                    board.turn == player_color and child["swing"] <= -threshold
-                )
-                child["our_mistake"] = our_mistake or (
-                    board.turn != player_color and child["swing"] > 0
-                )
             node["children"].append(child)
 
     walk(root)
+
+    def remove_internal_fields(node):
+        node.pop("_path", None)
+        node.pop("position_key", None)
+        for child in node["children"]:
+            remove_internal_fields(child)
+    remove_internal_fields(root)
 
 
 def find_engine():
@@ -189,7 +322,7 @@ def find_engine():
     return shutil.which("stockfish") or "/usr/games/stockfish"
 
 
-def analyze(username, color, max_moves, max_games, depth, threshold):
+def analyze(username, color, max_moves, max_games, depth):
     if not USERNAME.fullmatch(username):
         raise ValueError("Enter a valid Chess.com username (1-25 letters, numbers, underscores or hyphens).")
     games = fetch_games(username, color, max_games)
@@ -198,7 +331,7 @@ def analyze(username, color, max_moves, max_games, depth, threshold):
         raise ValueError("No usable standard chess games found for that player and color.")
     try:
         with chess.engine.SimpleEngine.popen_uci(find_engine(), timeout=30) as engine:
-            evaluate_tree(root, engine, chess.WHITE if color == "white" else chess.BLACK, depth, threshold, max_moves)
+            evaluate_tree(root, engine, chess.WHITE if color == "white" else chess.BLACK, depth, max_moves)
     except FileNotFoundError as exc:
         raise RuntimeError("Stockfish was not found. Install it or set STOCKFISH_PATH.") from exc
     except (chess.engine.EngineError, OSError, TimeoutError) as exc:
@@ -206,6 +339,6 @@ def analyze(username, color, max_moves, max_games, depth, threshold):
     return {
         "tree": root, "selected_games": len(games), "skipped_games": skipped,
         "username": username, "color": color, "max_moves": max_moves,
-        "depth": depth, "threshold": threshold,
+        "depth": depth,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
