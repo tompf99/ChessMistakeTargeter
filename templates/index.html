@@ -13,12 +13,12 @@
       <p>Find opening lines where a Chess.com player makes a mistake that you can target.</p>
     </header>
     <form id="form">
-      <label>Chess.com username <input name="username" required maxlength="25" autocomplete="off"></label>
+      <label>Chess.com username <input name="username" value="thomasdanielpfeifer" required maxlength="25" autocomplete="off"></label>
       <label>Player's color
         <select name="color"><option value="white">White</option><option value="black">Black</option></select>
       </label>
       <label>Maximum full moves <input name="max_moves" type="number" min="1" max="30" value="10" required></label>
-      <label>Recent games to examine <input name="max_games" type="number" min="1" max="1000" value="100" required></label>
+      <label>Recent games (blank = unlimited) <input name="max_games" type="number" min="1" step="1" placeholder="Unlimited"></label>
       <label>Engine depth <input name="depth" type="number" min="1" max="20" value="8" required></label>
       <label>Player mistake threshold (centipawns) <input name="threshold" type="number" min="1" max="10000" value="100" required></label>
       <button type="submit">Analyze games</button>
@@ -36,12 +36,13 @@
           <label class="filter"><input type="checkbox" id="targets"> Show only paths to target positions</label>
           <div class="table-wrap">
             <table>
-              <thead><tr><th>Move</th><th>Games</th><th>Last played</th><th>Eval</th><th>Change</th><th>Line status</th></tr></thead>
+              <thead><tr><th>Move</th><th>Rank</th><th>Source</th><th>Games</th><th>Last played</th><th>Eval</th><th>Loss vs best</th><th>Change</th><th>Line status</th></tr></thead>
               <tbody id="moves"></tbody>
             </table>
           </div>
           <p id="empty" hidden>No moves to show at this position.</p>
-          <p class="hint">Target: the selected player made a mistake and our side's evaluation never dropped. Avoid: our side's evaluation dropped. Counts are within the analyzed sample; rows are sorted by frequency, then recency.</p>
+          <p class="hint">Moves are ranked for the side to move among recorded moves and the top three engine choices. Loss vs best is in pawns. A top engine choice may also have been played; zero games means it was not in the sample. Engine-only moves show a position but have no continuation.</p>
+          <p class="hint">Target: the selected player made a mistake and our side's evaluation never dropped. Avoid: our side's evaluation dropped by any amount at this or an earlier move, even 1 centipawn. Engine estimates can fluctuate; the player mistake threshold does not apply to our side.</p>
         </div>
       </div>
     </section>

@@ -61,8 +61,12 @@ function render() {
     button.addEventListener("click", () => { line.push(child); render(); });
     moveCell.append(button);
     const status = child.our_mistake ? "Avoid" : isTarget(child) ? "Target" : "No mistake yet";
-    const date = child.last_played ? new Date(child.last_played * 1000).toISOString().slice(0, 10) : "Unknown";
-    for (const value of [child.games, date, displayScore(child.evaluation), displayScore(child.swing), status]) {
+    const date = child.last_played ? new Date(child.last_played * 1000).toISOString().slice(0, 10) : "—";
+    for (const value of [
+      child.rank, child.engine_choice ? (child.games ? "Engine + played" : "Engine") : "Played",
+      child.games, date, displayScore(child.evaluation),
+      (child.loss / 100).toFixed(2), displayScore(child.swing), status
+    ]) {
       row.insertCell().textContent = value;
     }
     row.lastElementChild.className = child.our_mistake ? "avoid" : isTarget(child) ? "target" : "";
@@ -76,7 +80,8 @@ form.addEventListener("submit", async event => {
   const values = new FormData(form);
   const payload = {
     username: values.get("username"), color: values.get("color"),
-    max_moves: Number(values.get("max_moves")), max_games: Number(values.get("max_games")),
+    max_moves: Number(values.get("max_moves")),
+    max_games: values.get("max_games") === "" ? null : Number(values.get("max_games")),
     depth: Number(values.get("depth")), threshold: Number(values.get("threshold"))
   };
   const submit = form.querySelector("button");

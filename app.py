@@ -19,6 +19,13 @@ def integer(data, key, default, minimum, maximum):
     return value
 
 
+def game_limit(data):
+    value = data.get("max_games")
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        raise ValueError("max_games must be a positive integer or null for unlimited.")
+    return value
+
+
 @app.post("/api/analyze")
 def analyze_games():
     try:
@@ -35,7 +42,7 @@ def analyze_games():
         result = analyze(
             username, color,
             integer(data, "max_moves", 10, 1, 30),
-            integer(data, "max_games", 100, 1, 1000),
+            game_limit(data),
             integer(data, "depth", 8, 1, 20),
             integer(data, "threshold", 100, 1, 10000),
         )
