@@ -2,7 +2,7 @@ import os
 
 from flask import Flask, jsonify, render_template, request
 
-from analyzer import analyze
+from analyzer import analyze, explore_move
 
 app = Flask(__name__)
 
@@ -46,6 +46,27 @@ def analyze_games():
             integer(data, "depth", 8, 1, 20),
         )
         return jsonify(result)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except RuntimeError as exc:
+        return jsonify(error=str(exc)), 502
+
+
+@app.post("/api/move")
+def move():
+    try:
+        data = request.get_json()
+        if not isinstance(data, dict):
+            raise ValueError("Expected a JSON object.")
+        fen, uci, color = data.get("fen"), data.get("uci"), data.get("color")
+        if not isinstance(fen, str) or not isinstance(uci, str):
+            raise ValueError("Position and move must be text.")
+        if color not in ("white", "black"):
+            raise ValueError("Choose white or black for the player.")
+        return jsonify(explore_move(
+            fen, uci, color, integer(data, "depth", 8, 1, 20),
+            integer(data, "max_moves", 10, 1, 30),
+        ))
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
     except RuntimeError as exc:

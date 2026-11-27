@@ -53,9 +53,10 @@ def fetch_games(username, color, limit):
     return selected
 
 
-def new_node(san, fen):
+def new_node(san, fen, uci=None):
     return {
-        "move": san, "fen": fen, "games": 0, "position_games": 0,
+        "move": san, "uci": uci, "fen": fen, "games": 0, "position_games": 0,
+        "path_games": 0, "path_last_played": 0,
         "last_played": 0, "opening_name": None, "transpositions": [],
         "children": {}, "evaluation": None, "swing": None,
         "rank": None, "loss": None, "engine_choice": False,
@@ -134,6 +135,8 @@ def build_tree(games, max_moves):
         node = root
         node["games"] += 1
         node["last_played"] = max(node["last_played"], date)
+        node["path_games"] += 1
+        node["path_last_played"] = max(node["path_last_played"], date)
         board = chess.Board()
         path = []
         node["position_key"] = add_position(board, game_id, date, path, opening)
@@ -146,6 +149,9 @@ def build_tree(games, max_moves):
             node = node["children"].setdefault(uci, new_node(san, fen))
             node["games"] += 1
             node["last_played"] = max(node["last_played"], date)
+            node["path_games"] += 1
+            node["path_last_played"] = max(node["path_last_played"], date)
+            node["uci"] = uci
             node["position_key"] = target_key
             node["_path"] = tuple(path)
             board.push_uci(uci)
@@ -191,7 +197,7 @@ def classify_move(loss, is_book=False):
     return "Blunder"
 
 
-def evaluate_tree(root, engine, player_color, depth, max_moves):
+def evaluate_tree(root, engine, player_color, depth, max_moves, start_ply=0):
     """Scores and swings are always from the chosen player's perspective."""
     cache = {}
     analysis = root.pop("_analysis", {"edge_stats": {}, "position_stats": {}})
@@ -277,7 +283,7 @@ def evaluate_tree(root, engine, player_color, depth, max_moves):
             if child is None:
                 san = board.san(move)
                 board.push(move)
-                child = new_node(san, board.fen())
+                child = new_node(san, board.fen(), uci)
                 board.pop()
                 child["position_key"] = position_key(chess.Board(child["fen"]))
                 edge = edge_stats.get((position_key(board), uci))
@@ -304,7 +310,7 @@ def evaluate_tree(root, engine, player_color, depth, max_moves):
                 child["evaluation"] = score(child["fen"])
             node["children"].append(child)
 
-    walk(root)
+    walk(root, start_ply)
 
     def remove_internal_fields(node):
         node.pop("_path", None)
@@ -312,6 +318,66 @@ def evaluate_tree(root, engine, player_color, depth, max_moves):
         for child in node["children"]:
             remove_internal_fields(child)
     remove_internal_fields(root)
+
+
+def lines_of_interest(root):
+    """Find recorded lines with a player mistake and an effective recorded reply."""
+    lines = []
+
+    def walk(node, route, saw_mistake=False, replied=False):
+        for child in node["children"]:
+            if not child["path_games"]:
+                continue
+            if not child["player_move"] and child["status"] not in ("Book", "Excellent"):
+                continue
+            mistake = child["player_move"] and child["status"] in ("Mistake", "Blunder")
+            has_mistake = saw_mistake or mistake
+            has_reply = replied or (saw_mistake and not child["player_move"])
+            path = route + [child]
+            if has_mistake and has_reply and child["evaluation"] < 0:
+                lines.append({
+                    "moves": [item["uci"] for item in path],
+                    "line": format_line([item["move"] for item in path]),
+                    "games": child["path_games"],
+                    "last_played": child["path_last_played"],
+                    "evaluation": child["evaluation"],
+                    "opening_name": child["opening_name"],
+                })
+            else:
+                walk(child, path, has_mistake, has_reply)
+
+    walk(root, [])
+    return sorted(lines, key=lambda item: (-item["games"], -item["last_played"], item["line"]))
+
+
+def explore_move(fen, uci, color, depth, max_moves):
+    try:
+        board = chess.Board(fen)
+        move = chess.Move.from_uci(uci)
+    except ValueError as exc:
+        raise ValueError("Invalid position or move.") from exc
+    if not board.is_valid() or board.is_game_over():
+        raise ValueError("This position cannot be played.")
+    if board.ply() >= max_moves * 2:
+        raise ValueError("The configured line length has been reached.")
+    if move not in board.legal_moves:
+        raise ValueError("That move is not legal.")
+    root = new_node("", board.fen())
+    san = board.san(move)
+    board.push(move)
+    selected = new_node(san, board.fen(), move.uci())
+    selected["games"] = 1
+    root["children"][move.uci()] = selected
+    try:
+        with chess.engine.SimpleEngine.popen_uci(find_engine(), timeout=30) as engine:
+            evaluate_tree(root, engine, chess.WHITE if color == "white" else chess.BLACK,
+                          depth, max_moves, start_ply=board.ply() - 1)
+    except FileNotFoundError as exc:
+        raise RuntimeError("Stockfish was not found. Install it or set STOCKFISH_PATH.") from exc
+    except (chess.engine.EngineError, OSError, TimeoutError) as exc:
+        raise RuntimeError(f"Chess engine failed: {exc}") from exc
+    selected["games"] = 0
+    return selected
 
 
 def find_engine():
@@ -338,6 +404,7 @@ def analyze(username, color, max_moves, max_games, depth):
         raise RuntimeError(f"Chess engine failed: {exc}") from exc
     return {
         "tree": root, "selected_games": len(games), "skipped_games": skipped,
+        "lines_of_interest": lines_of_interest(root),
         "username": username, "color": color, "max_moves": max_moves,
         "depth": depth,
         "generated_at": datetime.now(timezone.utc).isoformat(),
