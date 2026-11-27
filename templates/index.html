@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Chess Mistake Targeter</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Chess Mistake Targeter</h1>
+      <p>Find opening lines where a Chess.com player makes a mistake that you can target.</p>
+    </header>
+    <form id="form">
+      <label>Chess.com username <input name="username" required maxlength="25" autocomplete="off"></label>
+      <label>Player's color
+        <select name="color"><option value="white">White</option><option value="black">Black</option></select>
+      </label>
+      <label>Maximum full moves <input name="max_moves" type="number" min="1" max="30" value="10" required></label>
+      <label>Recent games to examine <input name="max_games" type="number" min="1" max="1000" value="100" required></label>
+      <label>Engine depth <input name="depth" type="number" min="1" max="20" value="8" required></label>
+      <label>Player mistake threshold (centipawns) <input name="threshold" type="number" min="1" max="10000" value="100" required></label>
+      <button type="submit">Analyze games</button>
+    </form>
+    <p id="message" role="status" aria-live="polite"></p>
+    <section id="results" hidden>
+      <p id="summary"></p>
+      <div class="workspace">
+        <div>
+          <div id="board" class="board" aria-label="Chess position"></div>
+          <p class="hint">Positive evaluations favor the selected player. Select a move to explore its position.</p>
+        </div>
+        <div class="tree">
+          <nav id="path" aria-label="Opening line"></nav>
+          <label class="filter"><input type="checkbox" id="targets"> Show only paths to target positions</label>
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>Move</th><th>Games</th><th>Last played</th><th>Eval</th><th>Change</th><th>Line status</th></tr></thead>
+              <tbody id="moves"></tbody>
+            </table>
+          </div>
+          <p id="empty" hidden>No moves to show at this position.</p>
+          <p class="hint">Target: the selected player made a mistake and our side's evaluation never dropped. Avoid: our side's evaluation dropped. Counts are within the analyzed sample; rows are sorted by frequency, then recency.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>
