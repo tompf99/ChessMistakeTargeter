@@ -44,7 +44,6 @@ def analyze_games():
             integer(data, "max_moves", 10, 1, 30),
             game_limit(data),
             integer(data, "depth", 8, 1, 20),
-            integer(data, "threshold", 100, 1, 10000),
         )
         return jsonify(result)
     except ValueError as exc:
