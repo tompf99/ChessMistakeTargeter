@@ -22,6 +22,7 @@ button:disabled { opacity: .6; cursor: wait; }
 .transpositions { margin: .5rem 0; padding: .5rem .7rem; background: #e8eee9; border-radius: .3rem; font-size: .82rem; }
 .transpositions ul { margin: .35rem 0 0; padding-left: 1.2rem; }
 .square { position: relative; display: grid; place-items: center; min-width: 0; min-height: 0; padding: 0; border: 0; border-radius: 0; color: #202a31; font-family: "DejaVu Sans", sans-serif; font-size: clamp(1.3rem, 3vw, 2.8rem); line-height: 1; cursor: pointer; }
+.square.dragging { opacity: 0.3; }
 .coordinate { position: absolute; pointer-events: none; font: bold .65rem system-ui, sans-serif; }
 .rank-label { top: 2px; left: 3px; }
 .file-label { bottom: 2px; right: 3px; }
@@ -52,11 +53,16 @@ nav button[aria-current=step] { background: #246a50; color: white; }
 #board-message:empty { display: none; }
 .progress { display: grid; gap: .3rem; max-width: 420px; margin: .5rem 0 1rem; }
 .progress progress { width: 100%; accent-color: #246a50; }
-.table-wrap { overflow-x: auto; }
+.table-wrap { overflow-x: auto; overflow-y: visible; }
 table { width: 100%; border-collapse: collapse; background: white; text-align: left; }
 th, td { padding: .65rem; border-bottom: 1px solid #e0e6e3; white-space: nowrap; }
-th { font-size: .8rem; color: #53616a; }
+th { font-size: .8rem; color: #53616a; cursor: pointer; user-select: none; }
+th:hover { background: #f0f0f0; }
+#interest-lines th { cursor: pointer; }
+#interest-lines th:hover { background: #f0f0f0; }
+main { scrollbar-gutter: stable; }
 td button { background: transparent; color: #176444; font-weight: 700; padding: .15rem; }
+.continue-message { background: #fff4e6; font-style: italic; color: #666; }
 .book, .excellent { color: #176444; font-weight: 700; }
 .inaccuracy { color: #9a7a12; font-weight: 700; }
 .mistake { color: #bd6818; font-weight: 700; }

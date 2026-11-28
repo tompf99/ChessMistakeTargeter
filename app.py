@@ -2,12 +2,17 @@ import os
 import json
 import queue
 import threading
+import webbrowser
+import atexit
+from pathlib import Path
 
 from flask import Flask, Response, jsonify, render_template, request
 
-from analyzer import analyze, explore_move
+from analyzer import analyze, evaluate_position, explore_move
 
 app = Flask(__name__)
+CACHE_DIR = Path(__file__).parent / "data" / "cache"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @app.get("/")
@@ -71,9 +76,10 @@ def analyze_stream():
         pass
 
     def send(event):
+        encoded = json.dumps(event) + "\n"
         while not stopped.is_set():
             try:
-                events.put(event, timeout=0.2)
+                events.put((event["type"], encoded), timeout=0.2)
                 return
             except queue.Full:
                 continue
@@ -82,9 +88,14 @@ def analyze_stream():
     def progress(phase, completed, total):
         send({"type": "progress", "phase": phase, "completed": completed, "total": total})
 
+    def interest(item):
+        send({"type": "interest", "data": item})
+
     def worker():
         try:
-            send({"type": "result", "data": analyze(*arguments, progress=progress)})
+            from analyzer import analyze_with_streaming
+            for event in analyze_with_streaming(*arguments, progress=progress, interest=interest):
+                send(event)
         except ClientDisconnected:
             return
         except (ValueError, RuntimeError) as exc:
@@ -104,9 +115,9 @@ def analyze_stream():
         thread.start()
         try:
             while True:
-                event = events.get()
-                yield json.dumps(event) + "\n"
-                if event["type"] in ("result", "error"):
+                event_type, encoded = events.get()
+                yield encoded
+                if event_type in ("result", "error"):
                     break
         finally:
             stopped.set()
@@ -126,8 +137,12 @@ def move():
             raise ValueError("Position and move must be text.")
         if color not in ("white", "black"):
             raise ValueError("Choose white or black for the player.")
+        depth = integer(data, "depth", 8, 1, 20)
+        # Increase depth if user is actively looking at this position
+        if data.get("focused"):
+            depth = min(depth + 4, 20)
         return jsonify(explore_move(
-            fen, uci, color, integer(data, "depth", 8, 1, 20),
+            fen, uci, color, depth,
             integer(data, "max_moves", 10, 1, 30),
         ))
     except ValueError as exc:
@@ -136,5 +151,41 @@ def move():
         return jsonify(error=str(exc)), 502
 
 
+@app.post("/api/position")
+def position():
+    try:
+        data = request.get_json()
+        if not isinstance(data, dict):
+            raise ValueError("Expected a JSON object.")
+        fen, moves, color = data.get("fen"), data.get("moves"), data.get("color")
+        if not isinstance(fen, str) or not isinstance(moves, list) or len(moves) > 256 or any(
+            not isinstance(move, str) for move in moves
+        ):
+            raise ValueError("Position and moves must be valid.")
+        if color not in ("white", "black"):
+            raise ValueError("Choose white or black for the player.")
+        depth = integer(data, "depth", 8, 1, 20)
+        return jsonify(evaluate_position(fen, moves, color, depth))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except RuntimeError as exc:
+        return jsonify(error=str(exc)), 502
+
+
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5000")), threaded=True)
+    port = int(os.environ.get("PORT", "5000"))
+    url = f"http://127.0.0.1:{port}"
+    
+    # Open browser after a brief delay to allow server to start
+    def open_browser():
+        import time
+        time.sleep(1)
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    
+    browser_thread = threading.Thread(target=open_browser, daemon=True)
+    browser_thread.start()
+    
+    app.run(host="127.0.0.1", port=port, threaded=True)
