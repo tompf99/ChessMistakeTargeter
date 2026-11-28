@@ -511,7 +511,7 @@ board.addEventListener("pointermove", event => {
     pointerStart.ghost = document.createElement("span");
     pointerStart.ghost.className = "drag-piece";
     pointerStart.ghost.textContent = pointerStart.piece;
-    document.body.append(pointerStart.ghost);
+    board.parentElement.append(pointerStart.ghost);
   }
   pointerStart.ghost.style.left = `${event.clientX}px`;
   pointerStart.ghost.style.top = `${event.clientY}px`;
